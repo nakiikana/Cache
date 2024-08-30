@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"context"
 	"sync"
 	"time"
 )
@@ -15,15 +16,22 @@ type ICache interface {
 	Remove(key any)
 }
 
+type Item struct {
+	value any
+	ttl   time.Duration
+}
+
 type Cache struct {
-	items map[any]any
-	mu    sync.Mutex
+	items map[any]Item
+	mu    *sync.Mutex
 	size  int
 }
 
-func New(N int64) *Cache {
+func New(N int) *Cache {
 	return &Cache{
-		items: make(map[any]any),
+		items: make(map[any]Item),
+		mu:    &sync.Mutex{},
+		size:  N,
 	}
 }
 
@@ -38,19 +46,41 @@ func (c *Cache) Len() int {
 func (c *Cache) Clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for k := range c.items {
-		delete(c.items, k)
+	for key := range c.items {
+		delete(c.items, key)
 	}
 }
 
-func (c *Cache) Remove(k any) {
+func (c *Cache) Remove(key any) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	delete(c.items, k)
+	delete(c.items, key)
 }
 
-func (c *Cache) Add(k, v any) {
+func (c *Cache) Add(key, value any) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.items[k] = v
+	c.items[key] = Item{value: value}
+}
+
+func (c *Cache) AddWithTTL(key, value any, ttl time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.items[key] = Item{value: value, ttl: ttl}
+	go func(key any, ttl time.Duration) {
+		ctx, cancel := context.WithTimeout(context.Background(), ttl)
+		defer cancel()
+		select {
+		case <-ctx.Done():
+			c.Remove(key)
+		}
+	}(key, ttl)
+}
+
+func (c *Cache) Get(key any) (value any, ok bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	value, ok = c.items[key]
+	return
 }
