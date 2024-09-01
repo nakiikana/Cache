@@ -10,9 +10,9 @@ import (
 type ICache interface {
 	Cap() int
 	Len() int
-	Clear() // удаляет все ключи
+	Clear()
 	Add(key, value any)
-	AddWithTTL(key, value any, ttl time.Duration) // добавляет ключ со сроком жизни ttl
+	AddWithTTL(key, value any, ttl time.Duration)
 	Get(key any) (value any, ok bool)
 	Remove(key any)
 }
@@ -24,22 +24,24 @@ type Item struct {
 }
 
 type Cache struct {
-	items    map[any]*list.Element
-	mu       sync.RWMutex
-	cap      int
-	lruQueue *list.List
-	done     chan struct{}
+	items          map[any]*list.Element
+	mu             sync.RWMutex
+	cap            int
+	lruQueue       *list.List
+	done           chan struct{}
+	cleanFrequency time.Duration
 }
 
 const noEviction time.Duration = 1<<63 - 1 //about 292 years
 
-func NewLRUCache(N int) *Cache {
+func NewLRUCache(N int, f time.Duration) *Cache {
 	c := &Cache{
-		items:    make(map[any]*list.Element),
-		mu:       sync.RWMutex{},
-		cap:      N,
-		lruQueue: list.New(),
-		done:     make(chan struct{}),
+		items:          make(map[any]*list.Element),
+		mu:             sync.RWMutex{},
+		cap:            N,
+		lruQueue:       list.New(),
+		done:           make(chan struct{}),
+		cleanFrequency: f,
 	}
 	go c.checkIfExpired()
 	return c
@@ -101,6 +103,7 @@ func (c *Cache) Get(key any) (value any, ok bool) {
 	defer c.mu.Unlock()
 	if elem, ok := c.items[key]; ok {
 		if time.Now().After(elem.Value.(*Item).ttl) {
+			c.unsafeRemove(key)
 			return nil, false
 		}
 		c.lruQueue.MoveToFront(elem)
@@ -112,7 +115,10 @@ func (c *Cache) Get(key any) (value any, ok bool) {
 func (c *Cache) Remove(key any) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.unsafeRemove(key)
+}
 
+func (c *Cache) unsafeRemove(key any) {
 	if elem, ok := c.items[key]; ok {
 		delete(c.items, key)
 		c.lruQueue.Remove(elem)
@@ -134,13 +140,13 @@ func (c *Cache) removeExpired() {
 	for key, elem := range c.items {
 		if now.After(elem.Value.(*Item).ttl) {
 			log.Println("Removing expired item with key: ", key)
-			c.Remove(key)
+			c.unsafeRemove(key)
 		}
 	}
 }
 
 func (c *Cache) checkIfExpired() {
-	tick := time.NewTicker(2 * time.Second)
+	tick := time.NewTicker(c.cleanFrequency)
 	defer tick.Stop()
 	for {
 		select {
