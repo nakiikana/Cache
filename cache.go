@@ -2,6 +2,7 @@ package cache
 
 import (
 	"container/list"
+	"log"
 	"sync"
 	"time"
 )
@@ -19,23 +20,29 @@ type ICache interface {
 type Item struct {
 	key   any
 	value any
-	ttl   time.Duration
+	ttl   time.Time
 }
 
 type Cache struct {
 	items    map[any]*list.Element
-	mu       *sync.Mutex
+	mu       sync.RWMutex
 	cap      int
 	lruQueue *list.List
+	done     chan struct{}
 }
 
-func New(N int) *Cache {
-	return &Cache{
+const noEviction time.Duration = 1<<63 - 1 //about 292 years
+
+func NewLRUCache(N int) *Cache {
+	c := &Cache{
 		items:    make(map[any]*list.Element),
-		mu:       &sync.Mutex{},
+		mu:       sync.RWMutex{},
 		cap:      N,
 		lruQueue: list.New(),
+		done:     make(chan struct{}),
 	}
+	go c.checkIfExpired()
+	return c
 }
 
 func (c *Cache) Cap() int {
@@ -43,6 +50,9 @@ func (c *Cache) Cap() int {
 }
 
 func (c *Cache) Len() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	return c.lruQueue.Len()
 }
 
@@ -55,21 +65,32 @@ func (c *Cache) Clear() {
 }
 
 func (c *Cache) Add(key, value any) {
+	c.AddWithTTL(key, value, 0)
+}
+
+func (c *Cache) AddWithTTL(key, value any, ttl time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	now := time.Now()
+	if ttl == 0 {
+		ttl = noEviction
+	}
 	if elem, ok := c.items[key]; ok {
 		c.lruQueue.MoveToFront(elem)
 		elem.Value.(*Item).value = value
+		elem.Value.(*Item).ttl = now.Add(ttl)
 		return
 	}
+
 	if c.lruQueue.Len() == c.cap {
 		c.removeLRU()
 	}
+
 	item := &Item{
 		key:   key,
 		value: value,
-		ttl:   0,
+		ttl:   now.Add(ttl),
 	}
 	newElem := c.lruQueue.PushFront(item)
 	c.items[key] = newElem
@@ -78,8 +99,10 @@ func (c *Cache) Add(key, value any) {
 func (c *Cache) Get(key any) (value any, ok bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
 	if elem, ok := c.items[key]; ok {
+		if time.Now().After(elem.Value.(*Item).ttl) {
+			return nil, false
+		}
 		c.lruQueue.MoveToFront(elem)
 		return elem.Value.(*Item).value, true
 	}
@@ -99,21 +122,36 @@ func (c *Cache) Remove(key any) {
 func (c *Cache) removeLRU() {
 	if elem := c.lruQueue.Back(); elem != nil {
 		delete(c.items, elem.Value.(*Item).key)
-		c.lruQueue.Remove(c.lruQueue.Back())
+		c.lruQueue.Remove(elem)
 	}
 }
 
-// func (c *Cache) AddWithTTL(key, value any, ttl time.Duration) {
-// 	c.mu.Lock()
-// 	defer c.mu.Unlock()
+func (c *Cache) removeExpired() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-// 	c.items[key] = item{value: value, ttl: ttl}
-// 	go func(key any, ttl time.Duration) {
-// 		ctx, cancel := context.WithTimeout(context.Background(), ttl)
-// 		defer cancel()
-// 		select {
-// 		case <-ctx.Done():
-// 			c.Remove(key)
-// 		}
-// 	}(key, ttl)
-// }
+	now := time.Now()
+	for key, elem := range c.items {
+		if now.After(elem.Value.(*Item).ttl) {
+			log.Println("Removing expired item with key: ", key)
+			c.Remove(key)
+		}
+	}
+}
+
+func (c *Cache) checkIfExpired() {
+	tick := time.NewTicker(2 * time.Second)
+	defer tick.Stop()
+	for {
+		select {
+		case <-tick.C:
+			c.removeExpired()
+		case <-c.done:
+			return
+		}
+	}
+}
+
+func (c *Cache) finishWork() {
+	close(c.done)
+}
